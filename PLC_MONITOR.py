@@ -10,7 +10,7 @@ from typing import Dict, List, Optional, Set
 import panel as pn
 import pyads
 
-pn.extension(sizing_mode="stretch_width")
+pn.extension(sizing_mode="stretch_width", notifications=True)
 pn.config.sizing_mode = "stretch_width"
 
 
@@ -18,6 +18,7 @@ pn.config.sizing_mode = "stretch_width"
 class VariableSpec:
     name: str
     references: str
+    description: str
 
 
 @dataclass
@@ -34,6 +35,7 @@ class AdsMonitor:
             host: Optional[str] = None,
             csv_path: str = "layout.csv",
             watch_csv_path: str = "watchlist.csv",
+            cleaned_csv_path: str = "layout.cleaned.csv",
             poll_ms: int = 1000,
     ):
         self.ams_net_id = ams_net_id
@@ -41,9 +43,11 @@ class AdsMonitor:
         self.host = host
         self.csv_path = csv_path
         self.watch_csv_path = watch_csv_path
+        self.cleaned_csv_path = cleaned_csv_path
         self.poll_ms = poll_ms
 
         self.groups = self._load_layout_csv(csv_path)
+        self._save_cleaned_layout_csv(self.cleaned_csv_path, self.groups)
         self.variable_specs = self._build_variable_index(self.groups)
         self._all_variable_names: List[str] = list(self.variable_specs.keys())
 
@@ -62,6 +66,9 @@ class AdsMonitor:
 
         self.status = pn.pane.Alert("Disconnected", alert_type="warning", sizing_mode="stretch_width")
         self.last_update = pn.pane.Markdown("**Last update:** never")
+        self.expanded_descriptions: Set[str] = set()
+        self.watch_row_containers: Dict[str, pn.Column] = {}
+        self.main_row_containers: Dict[str, pn.Column] = {}
 
         self.value_widgets: Dict[str, pn.pane.HTML] = {}
         self.boxes = self._build_boxes()
@@ -116,30 +123,51 @@ class AdsMonitor:
             raise FileNotFoundError(f"CSV file not found: {csv_path}")
 
         groups: Dict[str, List[VariableSpec]] = {}
+        seen_variables: Set[str] = set()
+
         with open(csv_path, newline="", encoding="utf-8-sig") as f:
             reader = csv.DictReader(f)
-            required = {"title", "variable", "references"}
+            required = {"title", "variable", "references", "description"}
             available = {name.strip().lower() for name in (reader.fieldnames or [])}
             if not reader.fieldnames or not required.issubset(available):
-                raise ValueError("CSV must contain headers: title, variable, references")
+                raise ValueError("CSV must contain headers: title, variable, references, description")
 
             field_map = {name.strip().lower(): name for name in reader.fieldnames}
             title_key = field_map["title"]
             variable_key = field_map["variable"]
             references_key = field_map["references"]
+            description_key = field_map["description"]
 
             for row in reader:
                 title = (row.get(title_key) or "").strip()
-                variable = (row.get(variable_key) or "").strip()
+                raw_variable = row.get(variable_key) or ""
+                variable = raw_variable.rstrip()
                 references = (row.get(references_key) or "").strip()
+                description = (row.get(description_key) or "").strip()
+
                 if not title or not variable:
                     continue
-                groups.setdefault(title, []).append(VariableSpec(name=variable, references=references))
 
-        if not groups:
-            raise ValueError("No valid rows found in CSV")
+                if any(ch.isspace() for ch in variable):
+                    continue
 
-        return [GroupSpec(title=title, variables=variables) for title, variables in groups.items()]
+                if variable in seen_variables:
+                    continue
+
+                seen_variables.add(variable)
+                groups.setdefault(title, []).append(
+                    VariableSpec(name=variable, references=references, description=description))
+
+        cleaned_groups = [
+            GroupSpec(title=title, variables=variables)
+            for title, variables in groups.items()
+            if variables
+        ]
+
+        if not cleaned_groups:
+            raise ValueError("No valid rows found in CSV after cleanup")
+
+        return cleaned_groups
 
     @staticmethod
     def _build_variable_index(groups: List[GroupSpec]) -> Dict[str, VariableSpec]:
@@ -176,15 +204,72 @@ class AdsMonitor:
             for variable_name in sorted(self.watch_set):
                 writer.writerow({"variable": variable_name})
 
-    def _build_variable_widget(self, spec: VariableSpec) -> pn.pane.HTML:
+    def _build_variable_widget(self, spec: VariableSpec) -> pn.Column:
         pane = pn.pane.HTML(
             self._format_row_html(spec.name, spec.references,
                                   self.current_values.get(spec.name, "Waiting for data...")),
             sizing_mode="stretch_width",
             margin=(0, 0, 0, 0),
         )
+        info_button = pn.widgets.Button(name="Info", button_type="light", width=70)
+        info_button.on_click(lambda _event, s=spec: self._toggle_description(s))
         self.value_widgets[spec.name] = pane
-        return pane
+
+        row = pn.Row(pane, info_button, sizing_mode="stretch_width", margin=(0, 0, 0, 0))
+        container = pn.Column(row, sizing_mode="stretch_width", margin=(0, 0, 0, 0))
+        self.main_row_containers[spec.name] = container
+        self._render_main_row(spec.name)
+        return container
+
+    def _build_description_pane(self, spec: VariableSpec) -> pn.pane.HTML:
+        description = spec.description or "No description available."
+        return pn.pane.HTML(
+            "<div style='margin:6px 0 10px 0;padding:10px 12px;border-left:3px solid #7a7a7a;"
+            "background:#f5f5f5;border-radius:6px;white-space:normal;'>"
+            f"<div style='font-size:12px;color:#666;margin-bottom:4px;'>Description</div>"
+            f"<div>{self._escape_html(description)}</div>"
+            "</div>",
+            sizing_mode="stretch_width",
+            margin=(0, 0, 0, 0),
+        )
+
+    def _toggle_description(self, spec: VariableSpec) -> None:
+        if spec.name in self.expanded_descriptions:
+            self.expanded_descriptions.discard(spec.name)
+        else:
+            self.expanded_descriptions.add(spec.name)
+        self._render_main_row(spec.name)
+        if spec.name in self.watch_set:
+            self._refresh_watch_widgets()
+
+    def _render_main_row(self, variable_name: str) -> None:
+        spec = self.variable_specs.get(variable_name)
+        container = self.main_row_containers.get(variable_name)
+        pane = self.value_widgets.get(variable_name)
+        if spec is None or container is None or pane is None:
+            return
+
+        info_button = pn.widgets.Button(name="Info", button_type="light", width=70)
+        info_button.on_click(lambda _event, s=spec: self._toggle_description(s))
+        base_row = pn.Row(pane, info_button, sizing_mode="stretch_width", margin=(0, 0, 0, 0))
+        objects = [base_row]
+        if variable_name in self.expanded_descriptions:
+            objects.append(self._build_description_pane(spec))
+        container.objects = objects
+
+    @staticmethod
+    def _save_cleaned_layout_csv(csv_path: str, groups: List[GroupSpec]) -> None:
+        with open(csv_path, "w", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=["title", "variable", "references", "description"])
+            writer.writeheader()
+            for group in groups:
+                for spec in group.variables:
+                    writer.writerow({
+                        "title": group.title,
+                        "variable": spec.name,
+                        "references": spec.references,
+                        "description": spec.description,
+                    })
 
     def _build_boxes(self) -> List[pn.Column]:
         boxes: List[pn.Column] = []
@@ -366,6 +451,7 @@ class AdsMonitor:
 
     def _refresh_watch_widgets(self) -> None:
         watch_items = []
+        self.watch_row_containers = {}
         for variable_name in sorted(self.watch_set):
             spec = self.variable_specs.get(variable_name)
             if spec is None:
@@ -381,6 +467,14 @@ class AdsMonitor:
                 margin=(0, 0, 0, 0),
             )
 
+            info_button = pn.widgets.Button(
+                name="Info",
+                button_type="light",
+                width=70,
+                align="end",
+            )
+            info_button.on_click(lambda _event, s=spec: self._toggle_description(s))
+
             remove_button = pn.widgets.Button(
                 name="Remove",
                 button_type="danger",
@@ -389,13 +483,17 @@ class AdsMonitor:
             )
             remove_button.on_click(lambda _event, v=variable_name: self._remove_watch_item(v))
 
-            row = pn.Row(
+            base_row = pn.Row(
                 pn.Column(row_html, sizing_mode="stretch_width"),
-                remove_button,
+                pn.Row(info_button, remove_button, sizing_mode="fixed", margin=(0, 0, 0, 8)),
                 sizing_mode="stretch_width",
                 margin=(0, 0, 6, 0),
             )
-            watch_items.append(row)
+            container = pn.Column(base_row, sizing_mode="stretch_width", margin=(0, 0, 6, 0))
+            if variable_name in self.expanded_descriptions:
+                container.append(self._build_description_pane(spec))
+            self.watch_row_containers[variable_name] = container
+            watch_items.append(container)
 
         self.watch_column.objects = watch_items or [
             pn.pane.Markdown("_No watch variables selected._", margin=(0, 0, 8, 0))
@@ -489,6 +587,7 @@ def build_app(args) -> pn.Column:
         host=args.host,
         csv_path=args.csv,
         watch_csv_path=args.watch_csv,
+        cleaned_csv_path=args.cleaned_csv,
         poll_ms=args.poll_ms,
     )
 
@@ -506,6 +605,7 @@ def parse_args():
     parser.add_argument("--host", default=None, help="Optional IP or hostname for the target")
     parser.add_argument("--csv", default="layout.csv", help="CSV file with title, variable, references columns")
     parser.add_argument("--watch-csv", default="watchlist.csv", help="CSV file used to persist the watch window")
+    parser.add_argument("--cleaned-csv", default="layout.cleaned.csv", help="Cleaned layout CSV written on startup")
     parser.add_argument("--poll-ms", type=int, default=1000, help="Polling interval in milliseconds")
     parser.add_argument("--auto-connect", action="store_true", help="Connect immediately on launch")
     return parser.parse_args()
