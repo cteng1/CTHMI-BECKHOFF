@@ -1,0 +1,1 @@
+panel serve PLC_MONITOR.py --show --args --ams-net-id 5.44.33.22.1.1 --ams-port 851 --host 192.168.0.10 --csv IO_config.csv --poll-ms 100
