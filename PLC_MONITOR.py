@@ -71,6 +71,7 @@ class AdsMonitor:
         self.main_row_containers: Dict[str, pn.Column] = {}
 
         self.value_widgets: Dict[str, pn.pane.HTML] = {}
+        self.watch_value_widgets: Dict[str, pn.pane.HTML] = {}
         self.boxes = self._build_boxes()
 
         self.watch_set: Set[str] = self._load_watch_csv(self.watch_csv_path)
@@ -109,11 +110,21 @@ class AdsMonitor:
     @classmethod
     def _format_row_html(cls, variable_name: str, references: str, value: str) -> str:
         return (
-            "<div style='display:grid;grid-template-columns:minmax(180px,1.4fr) minmax(120px,1fr) minmax(120px,1fr);"
-            "column-gap:12px;align-items:start;padding:6px 0;border-bottom:1px solid #ececec;'>"
-            f"<div><div style='font-size:11px;color:#666;'>Variable</div><div>{cls._escape_html(variable_name)}</div></div>"
-            f"<div><div style='font-size:11px;color:#666;'>References</div><div>{cls._escape_html(references)}</div></div>"
-            f"<div><div style='font-size:11px;color:#666;'>Value</div><div>{cls._escape_html(value)}</div></div>"
+            "<div style='padding:6px 0;border-bottom:1px solid #ececec;font-size:13px;'>"
+            "<div style='display:flex;flex-wrap:wrap;gap:8px 16px;align-items:flex-start;'>"
+            f"<div style='min-width:150px;flex:1 1 180px;overflow-wrap:anywhere;'>"
+            f"<div style='font-size:10px;color:#666;'>Variable</div>"
+            f"<div>{cls._escape_html(variable_name)}</div>"
+            f"</div>"
+            f"<div style='min-width:90px;flex:1 1 110px;overflow-wrap:anywhere;'>"
+            f"<div style='font-size:10px;color:#666;'>References</div>"
+            f"<div>{cls._escape_html(references)}</div>"
+            f"</div>"
+            f"<div style='min-width:120px;flex:1 1 130px;overflow-wrap:anywhere;font-weight:600;'>"
+            f"<div style='font-size:10px;color:#666;font-weight:400;'>Value</div>"
+            f"<div>{cls._escape_html(value)}</div>"
+            f"</div>"
+            "</div>"
             "</div>"
         )
 
@@ -204,6 +215,21 @@ class AdsMonitor:
             for variable_name in sorted(self.watch_set):
                 writer.writerow({"variable": variable_name})
 
+    def _build_write_controls(self, spec: VariableSpec) -> pn.Row:
+        write_input = pn.widgets.TextInput(
+            placeholder="Write value",
+            width=120,
+            margin=(0, 4, 0, 0),
+        )
+        write_button = pn.widgets.Button(
+            name="Write",
+            button_type="warning",
+            width=70,
+            margin=(0, 0, 0, 0),
+        )
+        write_button.on_click(lambda _event, s=spec, w=write_input: self._write_variable_background(s, w.value))
+        return pn.Row(write_input, write_button, sizing_mode="fixed", margin=(0, 0, 0, 8))
+
     def _build_variable_widget(self, spec: VariableSpec) -> pn.Column:
         pane = pn.pane.HTML(
             self._format_row_html(spec.name, spec.references,
@@ -213,9 +239,16 @@ class AdsMonitor:
         )
         info_button = pn.widgets.Button(name="Info", button_type="light", width=70)
         info_button.on_click(lambda _event, s=spec: self._toggle_description(s))
+        write_controls = self._build_write_controls(spec)
         self.value_widgets[spec.name] = pane
 
-        row = pn.Row(pane, info_button, sizing_mode="stretch_width", margin=(0, 0, 0, 0))
+        row = pn.Row(
+            pane,
+            write_controls,
+            info_button,
+            sizing_mode="stretch_width",
+            margin=(0, 0, 0, 0),
+        )
         container = pn.Column(row, sizing_mode="stretch_width", margin=(0, 0, 0, 0))
         self.main_row_containers[spec.name] = container
         self._render_main_row(spec.name)
@@ -251,7 +284,14 @@ class AdsMonitor:
 
         info_button = pn.widgets.Button(name="Info", button_type="light", width=70)
         info_button.on_click(lambda _event, s=spec: self._toggle_description(s))
-        base_row = pn.Row(pane, info_button, sizing_mode="stretch_width", margin=(0, 0, 0, 0))
+        write_controls = self._build_write_controls(spec)
+        base_row = pn.Row(
+            pane,
+            write_controls,
+            info_button,
+            sizing_mode="stretch_width",
+            margin=(0, 0, 0, 0),
+        )
         objects = [base_row]
         if variable_name in self.expanded_descriptions:
             objects.append(self._build_description_pane(spec))
@@ -381,8 +421,8 @@ class AdsMonitor:
                 self.value_widgets[key].object = self._format_row_html(spec.name, spec.references, value)
                 changed_variables.add(key)
 
-        if changed_variables & self.watch_set:
-            self._refresh_watch_widgets()
+        for variable_name in changed_variables & self.watch_set:
+            self._update_watch_value_widget(variable_name)
 
         if last_update is not None:
             self.last_update.object = f"**Last update:** {last_update}"
@@ -390,12 +430,53 @@ class AdsMonitor:
         if latest_status == "success":
             self.status.object = "Connected"
             self.status.alert_type = "success"
+        elif isinstance(latest_status, str) and latest_status.startswith("success::"):
+            self.status.object = latest_status.split("::", 1)[1]
+            self.status.alert_type = "success"
         elif isinstance(latest_status, str) and latest_status.startswith("warning::"):
             self.status.object = latest_status.split("::", 1)[1]
             self.status.alert_type = "warning"
         elif isinstance(latest_status, str) and latest_status.startswith("danger::"):
             self.status.object = latest_status.split("::", 1)[1]
             self.status.alert_type = "danger"
+
+    def _coerce_write_value(self, variable_name: str, raw_value: str):
+        text = (raw_value or "").strip()
+        current = self.current_values.get(variable_name, "")
+        current_lower = str(current).strip().lower()
+        text_lower = text.lower()
+
+        if text_lower in {"true", "false"}:
+            return text_lower == "true"
+        if current_lower in {"true", "false"} and text_lower in {"1", "0", "yes", "no", "on", "off"}:
+            return text_lower in {"1", "yes", "on"}
+
+        try:
+            if "." in text:
+                return float(text)
+            return int(text)
+        except ValueError:
+            return text
+
+    def _write_variable_background(self, spec: VariableSpec, raw_value: str) -> None:
+        if not raw_value or not raw_value.strip():
+            self.status.object = f"Write skipped for {spec.name}: empty value"
+            self.status.alert_type = "warning"
+            return
+
+        def runner():
+            try:
+                value = self._coerce_write_value(spec.name, raw_value)
+                with self._lock:
+                    if self._plc is None:
+                        raise RuntimeError("PLC is not connected")
+                    self._plc.write_by_name(spec.name, value)
+                self._result_queue.put(("__meta_status__", f"success::Wrote {raw_value} to {spec.name}"))
+                self._read_all_values_once()
+            except Exception as exc:
+                self._result_queue.put(("__meta_status__", f"danger::Write failed for {spec.name}: {exc}"))
+
+        threading.Thread(target=runner, daemon=True).start()
 
     def _connect_background(self) -> None:
         if self._connect_in_progress:
@@ -449,9 +530,22 @@ class AdsMonitor:
 
         self.search_results.options = options
 
+    def _update_watch_value_widget(self, variable_name: str) -> None:
+        spec = self.variable_specs.get(variable_name)
+        widget = self.watch_value_widgets.get(variable_name)
+        if spec is None or widget is None:
+            return
+        widget.object = self._format_row_html(
+            spec.name,
+            spec.references,
+            self.current_values.get(variable_name, "Waiting for data...")
+        )
+
     def _refresh_watch_widgets(self) -> None:
         watch_items = []
         self.watch_row_containers = {}
+        self.watch_value_widgets = {}
+
         for variable_name in sorted(self.watch_set):
             spec = self.variable_specs.get(variable_name)
             if spec is None:
@@ -466,6 +560,7 @@ class AdsMonitor:
                 sizing_mode="stretch_width",
                 margin=(0, 0, 0, 0),
             )
+            self.watch_value_widgets[variable_name] = row_html
 
             info_button = pn.widgets.Button(
                 name="Info",
@@ -483,8 +578,11 @@ class AdsMonitor:
             )
             remove_button.on_click(lambda _event, v=variable_name: self._remove_watch_item(v))
 
+            write_controls = self._build_write_controls(spec)
+
             base_row = pn.Row(
                 pn.Column(row_html, sizing_mode="stretch_width"),
+                write_controls,
                 pn.Row(info_button, remove_button, sizing_mode="fixed", margin=(0, 0, 0, 8)),
                 sizing_mode="stretch_width",
                 margin=(0, 0, 6, 0),
@@ -530,46 +628,56 @@ class AdsMonitor:
             sizing_mode="stretch_width",
         )
 
-        grid = pn.GridBox(
+        grid = pn.Column(
             *self.boxes,
-            ncols=2,
-            sizing_mode="stretch_both",
+            sizing_mode="stretch_width",
             min_height=500,
         )
 
         watch_controls = pn.Column(
-            "## Watch Window",
+            pn.pane.Markdown("## Watch Window", margin=(0, 0, 8, 0)),
             self.watch_column,
             pn.Spacer(height=16),
-            "## Search",
+            pn.pane.Markdown("## Search", margin=(0, 0, 8, 0)),
             self.search_input,
             self.search_results,
             pn.Row(self.add_watch_button, sizing_mode="stretch_width"),
-            sizing_mode="stretch_both",
-            min_width=420,
+            sizing_mode="stretch_width",
+            min_width=560,
+            width=650,
+            max_width=760,
             styles={
                 "border": "1px solid #d9d9d9",
                 "border-radius": "10px",
                 "padding": "12px 12px 24px 12px",
                 "background": "#ffffff",
                 "box-shadow": "0 1px 3px rgba(0,0,0,0.08)",
+                "box-sizing": "border-box",
+                "position": "sticky",
+                "top": "12px",
+                "align-self": "flex-start",
+                "max-height": "calc(100vh - 24px)",
+                "width": "100%",
+                "overflow-y": "auto",
+                "z-index": "10",
             },
         )
 
         main_content = pn.Row(
-            pn.Column(grid, sizing_mode="stretch_both"),
+            pn.Column(grid, sizing_mode="stretch_width", min_width=0),
             watch_controls,
-            sizing_mode="stretch_both",
+            sizing_mode="stretch_width",
+            styles={"align-items": "flex-start", "gap": "12px"},
         )
 
         return pn.Column(
-            "# ADS Variable Monitor",
+            pn.pane.Markdown("# ADS Variable Monitor", margin=(0, 0, 8, 0)),
             self.status,
             controls,
             self.last_update,
             pn.Spacer(height=8),
             main_content,
-            sizing_mode="stretch_both",
+            sizing_mode="stretch_width",
             min_height=700,
             styles={"padding-bottom": "24px"},
         )
