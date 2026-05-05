@@ -724,6 +724,11 @@ if __name__.startswith("bokeh"):
     pn.config.notifications = True
     app = build_app(ARGS)
     app.servable()
-elif __name__ == "__main__":
+if __name__ == "__main__":
     ARGS = parse_args()
-    pn.serve(build_app(ARGS), show=True, title="ADS Variable Monitor")
+    pn.serve(
+        build_app(ARGS),
+        show=True,
+        title="ADS Variable Monitor",
+        port=5006,
+        address="localhost",)
